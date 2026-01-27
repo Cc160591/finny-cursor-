@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Bell, Send, User, Loader2 } from "lucide-react";
+import { Bell, Send, User, Loader2, PlusCircle } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
 
@@ -13,31 +13,51 @@ type Message = {
     amount_cents: number;
     merchant: string;
   };
+  selection?: {
+    question: string;
+    options: { id: string; name: string }[];
+    pending_transaction: any;
+  };
 };
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [insightCount, setInsightCount] = useState(2); // Mock count
+  const [insightCount, setInsightCount] = useState(0); 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
 
-  // Verifica sessione e carica storico (mock per ora o reale se implementato)
+  // Verifica sessione e carica storico dal DB
   useEffect(() => {
-    const checkAuth = async () => {
+    const initChat = async () => {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) {
         router.push("/login");
+        return;
+      }
+
+      // Carica storico reale
+      const { data: history } = await supabase
+        .from("chat_messages")
+        .select("*")
+        .order("created_at", { ascending: true });
+
+      if (history && history.length > 0) {
+        setMessages(history.map(m => ({
+          id: m.id,
+          role: m.role,
+          content: m.content
+        })));
+      } else {
+        // Welcome generico se vuoto
+        setMessages([
+          { id: "welcome", role: "assistant", content: "Ciao! Sono Finny, il tuo coach finanziario. Come posso aiutarti oggi?" }
+        ]);
       }
     };
-    checkAuth();
     
-    // Inizializza con messaggi di benvenuto se vuoto
-    setMessages([
-      { id: "1", role: "assistant", content: "Hey Cleo, come vanno le finanze oggi?" },
-      { id: "2", role: "assistant", content: "Spero tu non abbia comprato l'ennesima pizza a mezzanotte..." }
-    ]);
+    initChat();
   }, [router]);
 
   const scrollToBottom = () => {
@@ -48,10 +68,10 @@ export default function ChatPage() {
     scrollToBottom();
   }, [messages]);
 
-  const handleSend = async () => {
-    if (!input.trim() || loading) return;
+  const handleSend = async (customPayload?: any) => {
+    if ((!input.trim() && !customPayload) || loading) return;
 
-    const userMsgText = input;
+    const userMsgText = customPayload ? `Selezionato conto: ${customPayload.account_name}` : input;
     const userMessage: Message = {
       id: Date.now().toString(),
       role: "user",
@@ -62,11 +82,6 @@ export default function ChatPage() {
     setInput("");
     setLoading(true);
 
-// #region agent log
-const logStart = {location:'app/page.tsx:67',message:'Fetch Start',data:{url:'/api/chat'},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'3'};
-console.log('DEBUG:', logStart);
-fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(logStart)}).catch(()=>{});
-// #endregion
     try {
       const { data: { session } } = await supabase.auth.getSession();
       
@@ -76,9 +91,8 @@ fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{metho
           "Content-Type": "application/json",
           "Authorization": `Bearer ${session?.access_token}`
         },
-        body: JSON.stringify({
-          message: userMsgText,
-          history: messages.map(m => ({ role: m.role, content: m.content }))
+        body: JSON.stringify(customPayload || {
+          message: userMsgText
         })
       });
 
@@ -95,13 +109,26 @@ fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{metho
         content: result.assistant_message,
       };
 
-      // Estrai prima transazione se presente
-      const transAction = result.actions?.find((a: any) => a.type === "create_transaction");
-      if (transAction) {
-        assistantMessage.transaction = {
-          amount_cents: transAction.data.amount_cents,
-          merchant: transAction.data.merchant
-        };
+      // Gestione azioni
+      if (result.actions) {
+        // 1. Transazione creata
+        const transAction = result.actions.find((a: any) => a.type === "transaction_created");
+        if (transAction) {
+          assistantMessage.transaction = {
+            amount_cents: transAction.data.amount_cents,
+            merchant: transAction.data.merchant
+          };
+        }
+
+        // 2. Richiesta selezione conto
+        const selectionAction = result.actions.find((a: any) => a.type === "needs_account_selection");
+        if (selectionAction) {
+          assistantMessage.selection = {
+            question: selectionAction.data.question,
+            options: selectionAction.data.options,
+            pending_transaction: selectionAction.data.pending_transaction
+          };
+        }
       }
 
       setMessages((prev) => [...prev, assistantMessage]);
@@ -116,6 +143,14 @@ fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{metho
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSelectAccount = (option: { id: string; name: string }, pendingTransaction: any) => {
+    handleSend({
+      selected_account_id: option.id,
+      account_name: option.name,
+      pending_transaction: pendingTransaction
+    });
   };
 
   return (
@@ -165,6 +200,20 @@ fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{metho
                   </span>
                 </div>
               )}
+
+              {msg.selection && (
+                <div className="flex flex-wrap gap-2 mt-2 ml-1">
+                  {msg.selection.options.map((option) => (
+                    <button
+                      key={option.id}
+                      onClick={() => handleSelectAccount(option, msg.selection?.pending_transaction)}
+                      className="bg-finny-accent text-white text-sm font-bold px-4 py-2 rounded-full shadow-md hover:bg-finny-accent/90 transition-all flex items-center space-x-1"
+                    >
+                      <span>{option.name}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         ))}
@@ -191,7 +240,7 @@ fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{metho
             className="flex-1 bg-white border-none rounded-full px-7 py-4 shadow-xl text-lg focus:outline-none focus:ring-2 focus:ring-finny-accent/30 placeholder:text-gray-400"
           />
           <button
-            onClick={handleSend}
+            onClick={() => handleSend()}
             disabled={!input.trim() || loading}
             className="bg-finny-accent text-white p-4 rounded-full shadow-2xl disabled:opacity-50 active:scale-90 transition-all transform"
           >

@@ -1,39 +1,17 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
-import fs from "fs";
-import path from "path";
-
-const LOG_PATH = "/Users/christiancoli/finny-web/.cursor/debug.log";
-
-function logToFile(payload: any) {
-  try {
-    const logDir = path.dirname(LOG_PATH);
-    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
-    fs.appendFileSync(LOG_PATH, JSON.stringify(payload) + "\n");
-  } catch (e) {}
-}
 
 export async function POST(req: Request) {
   try {
-// #region agent log
-const log1 = {location:'api/chat/route.ts:18',message:'API Route Entry',data:{hasSupabaseUrl:!!process.env.SUPABASE_URL,hasServiceKey:!!process.env.SUPABASE_SERVICE_ROLE_KEY,hasOpenaiKey:!!process.env.OPENAI_API_KEY},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'2'};
-logToFile(log1);
-fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(log1)}).catch(()=>{});
-// #endregion
     // 1. Validazione Variabili d'Ambiente
     const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
     const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const openaiApiKey = process.env.OPENAI_API_KEY;
 
     if (!supabaseUrl || !supabaseServiceKey || !openaiApiKey) {
-      console.error("Missing environment variables", {
-        hasUrl: !!supabaseUrl,
-        hasServiceKey: !!supabaseServiceKey,
-        hasOpenaiKey: !!openaiApiKey,
-      });
       return NextResponse.json(
-        { error: "Configurazione server incompleta (variabili d'ambiente mancanti)" },
+        { error: "Configurazione server incompleta" },
         { status: 500 }
       );
     }
@@ -45,70 +23,99 @@ fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{metho
     // 3. Verifica Autenticazione Utente
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
-      return NextResponse.json({ error: "Token di autorizzazione mancante" }, { status: 401 });
+      return NextResponse.json({ error: "Token mancante" }, { status: 401 });
     }
 
     const token = authHeader.replace("Bearer ", "");
-// #region agent log
-const log2 = {location:'api/chat/route.ts:40',message:'Auth Token Check',data:{tokenPreview:token.substring(0,10)+'...'},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'3'};
-logToFile(log2);
-fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(log2)}).catch(()=>{});
-// #endregion
     const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
 
     if (authError || !user) {
-// #region agent log
-const log3 = {location:'api/chat/route.ts:45',message:'Auth Failed',data:{error:authError},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'3'};
-logToFile(log3);
-fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(log3)}).catch(()=>{});
-// #endregion
-      console.error("Auth error:", authError);
-      return NextResponse.json({ error: "Sessione non valida o scaduta" }, { status: 401 });
+      return NextResponse.json({ error: "Sessione non valida" }, { status: 401 });
     }
 
     // 4. Lettura Body
-    const { message, history = [] } = await req.json();
-    if (!message) {
+    const { message, selected_account_id, pending_transaction } = await req.json();
+    if (!message && !selected_account_id) {
       return NextResponse.json({ error: "Messaggio mancante" }, { status: 400 });
     }
 
-    // 5. Fetch transazioni recenti (context per AI)
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    const { data: recentTransactions } = await supabaseAdmin
-      .from("transactions")
-      .select("merchant, amount_cents, occurred_at")
+    // 5. Fetch Context (History, Accounts, Balances)
+    
+    // a. History dal DB (ultimi 15 messaggi)
+    const { data: historyData } = await supabaseAdmin
+      .from("chat_messages")
+      .select("role, content")
       .eq("user_id", user.id)
-      .gte("occurred_at", sevenDaysAgo);
+      .order("created_at", { ascending: false })
+      .limit(15);
+    
+    const chatHistory = (historyData || []).reverse();
 
-    const pizzaCount = recentTransactions?.filter(t => 
-      t.merchant?.toLowerCase().includes("pizza")
-    ).length || 0;
+    // b. Accounts dal DB
+    const { data: accounts } = await supabaseAdmin
+      .from("accounts")
+      .select("*")
+      .eq("user_id", user.id);
+
+    // c. Calcolo Saldi per il contesto
+    const balancesContext = [];
+    if (accounts && accounts.length > 0) {
+      for (const acc of accounts) {
+        const { data: transactions } = await supabaseAdmin
+          .from("transactions")
+          .select("type, amount_cents")
+          .eq("account_id", acc.id);
+        
+        const balance = (transactions || []).reduce((accu, t) => {
+          return t.type === 'income' ? accu + Number(t.amount_cents) : accu - Number(t.amount_cents);
+        }, Number(acc.initial_balance_cents));
+        
+        balancesContext.push({
+          id: acc.id,
+          name: acc.name,
+          balance_cents: balance,
+          currency: acc.currency
+        });
+      }
+    }
 
     const systemPrompt = `
       Sei Finny, un coach finanziario personale ironico e smart.
-      Il tuo compito è aiutare l'utente a gestire le sue finanze.
-      
-      CONTEXT:
-      - Utente: ${user.email}
-      - Pizze mangiate negli ultimi 7 giorni: ${pizzaCount}
-      
+      Aiuti l'utente a gestire le sue finanze su diversi conti.
+
       REGOLE:
-      1. Se l'utente descrive una spesa o un'entrata, DEVI estrarre i dati.
-      2. Sii ironico se l'utente spende troppo in cose superflue (es: pizza, drink).
-      3. Se l'utente ha mangiato 5 o più pizze in una settimana, faglielo notare con sarcasmo.
-      4. Rispondi sempre in italiano, in modo colloquiale ma professionale.
-      
+      1. Se l'utente vuole creare un conto, usa l'azione "create_account".
+      2. Se l'utente registra una spesa/entrata:
+         - Se l'utente specifica il nome del conto, usalo.
+         - Se NON specifica e ci sono più conti, usa "needs_account_selection" per chiedere quale usare.
+         - Se c'è solo un conto, usalo automaticamente.
+         - Se non ci sono conti, dì all'utente che deve prima crearne uno.
+      3. Se l'utente chiede il saldo, hai i dati nel CONTESTO sotto.
+      4. Se l'utente chiede un riepilogo e ha più conti, chiedi se lo vuole per un conto specifico o per tutti.
+      5. Sii ironico e smart, ma professionale nei calcoli. Rispondi sempre in italiano.
+
+      CONTESTO UTENTE:
+      - Email: ${user.email}
+      - Conti attuali: ${JSON.stringify(balancesContext)}
+
       FORMATO RISPOSTA (JSON STRICT):
       {
-        "assistant_message": "Testo della tua risposta ironica",
+        "assistant_message": "La tua risposta colloquiale",
         "actions": [
           {
+            "type": "create_account",
+            "data": { "name": "string", "initial_balance_cents": number }
+          },
+          {
             "type": "create_transaction",
-            "data": {
-              "type": "expense" | "income",
-              "amount_cents": number,
-              "merchant": "string",
-              "notes": "string"
+            "data": { "type": "expense" | "income", "amount_cents": number, "merchant": "string", "account_id": "string", "account_name": "string" }
+          },
+          {
+            "type": "needs_account_selection",
+            "data": { 
+              "question": "Quale conto vuoi usare?", 
+              "options": [{ "id": "uuid", "name": "string" }],
+              "pending_transaction": { "type": "expense" | "income", "amount_cents": number, "merchant": "string" }
             }
           }
         ]
@@ -116,36 +123,27 @@ fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{metho
     `;
 
     // 6. Chiamata OpenAI
-// #region agent log
-const log4 = {location:'api/chat/route.ts:98',message:'OpenAI Call Start',data:{model:'gpt-4o-mini'},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'5'};
-logToFile(log4);
-fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(log4)}).catch(()=>{});
-// #endregion
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         { role: "system", content: systemPrompt },
-        ...history.slice(-10).map((m: any) => ({
+        ...chatHistory.map((m: any) => ({
           role: m.role,
           content: m.content
         })),
-        { role: "user", content: message }
+        { role: "user", content: message || `Ho selezionato il conto ${accounts?.find(a => a.id === selected_account_id)?.name}` }
       ],
       response_format: { type: "json_object" }
     });
 
     const aiResult = JSON.parse(response.choices[0].message.content || "{}");
 
-// #region agent log
-const log5 = {location:'api/chat/route.ts:114',message:'OpenAI Call Success',data:{aiMessage:aiResult.assistant_message},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'5'};
-logToFile(log5);
-fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(log5)}).catch(()=>{});
-// #endregion
-
     // 7. Persistenza messaggi
-    await supabaseAdmin
-      .from("chat_messages")
-      .insert({ user_id: user.id, role: "user", content: message });
+    if (message) {
+      await supabaseAdmin
+        .from("chat_messages")
+        .insert({ user_id: user.id, role: "user", content: message });
+    }
 
     const { data: assistantMsg } = await supabaseAdmin
       .from("chat_messages")
@@ -154,22 +152,77 @@ fetch('http://127.0.0.1:7244/ingest/96758caa-5fa3-4088-b7e9-c48caeafa71c',{metho
       .single();
 
     // 8. Esecuzione azioni estratte
+    const finalActions = [];
     if (aiResult.actions) {
       for (const action of aiResult.actions) {
+        if (action.type === "create_account") {
+          const { data: newAcc } = await supabaseAdmin
+            .from("accounts")
+            .insert({
+              user_id: user.id,
+              name: action.data.name,
+              initial_balance_cents: action.data.initial_balance_cents
+            })
+            .select()
+            .single();
+          finalActions.push({ type: "account_created", data: newAcc });
+        }
+
         if (action.type === "create_transaction") {
-          await supabaseAdmin.from("transactions").insert({
-            user_id: user.id,
-            type: action.data.type,
-            amount_cents: action.data.amount_cents,
-            merchant: action.data.merchant,
-            notes: action.data.notes,
-            message_id: assistantMsg?.id
-          });
+          let targetAccountId = action.data.account_id;
+          
+          // Se l'AI ha fornito il nome ma non l'ID, cerchiamolo
+          if (!targetAccountId && action.data.account_name) {
+            const acc = accounts?.find(a => a.name.toLowerCase() === action.data.account_name.toLowerCase());
+            if (acc) targetAccountId = acc.id;
+          }
+
+          // Se abbiamo l'ID, creiamo la transazione
+          if (targetAccountId) {
+            await supabaseAdmin.from("transactions").insert({
+              user_id: user.id,
+              account_id: targetAccountId,
+              type: action.data.type,
+              amount_cents: action.data.amount_cents,
+              merchant: action.data.merchant,
+              message_id: assistantMsg?.id
+            });
+            finalActions.push({ type: "transaction_created", data: action.data });
+          } else if (accounts && accounts.length > 1) {
+            // Se non abbiamo l'ID e ci sono più conti, forziamo la selezione
+            aiResult.actions.push({
+              type: "needs_account_selection",
+              data: {
+                question: "Su quale conto vuoi registrare questa spesa?",
+                options: accounts.map(a => ({ id: a.id, name: a.name })),
+                pending_transaction: action.data
+              }
+            });
+          } else if (accounts && accounts.length === 1) {
+            // Se c'è un solo conto, usiamolo
+            await supabaseAdmin.from("transactions").insert({
+              user_id: user.id,
+              account_id: accounts[0].id,
+              type: action.data.type,
+              amount_cents: action.data.amount_cents,
+              merchant: action.data.merchant,
+              message_id: assistantMsg?.id
+            });
+            finalActions.push({ type: "transaction_created", data: { ...action.data, account_id: accounts[0].id } });
+          }
+        }
+        
+        // Se l'azione è needs_account_selection, la passiamo pulita al client
+        if (action.type === "needs_account_selection") {
+          finalActions.push(action);
         }
       }
     }
 
-    return NextResponse.json(aiResult);
+    return NextResponse.json({
+      ...aiResult,
+      actions: finalActions
+    });
 
   } catch (error: any) {
     console.error("AI Route Error:", error);
