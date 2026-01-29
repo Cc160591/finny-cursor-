@@ -228,9 +228,9 @@ export default function ChatPage() {
                     <button
                       key={option.id}
                       onClick={() => handleSelectAccount(option, msg.selection?.pending_transaction)}
-                      className="bg-finny-accent text-white text-sm font-bold px-4 py-2 rounded-full shadow-md hover:bg-finny-accent/90 transition-all flex items-center space-x-1"
+                      className="bg-finny-accent text-white text-sm font-bold px-4 py-2 rounded-full shadow-md hover:bg-finny-accent/90 transition-all flex items-center space-x-1 border border-white/10"
                     >
-                      <span>{option.name}</span>
+                      <span className="text-white">{option.name}</span>
                     </button>
                   ))}
                 </div>
@@ -284,7 +284,7 @@ export default function ChatPage() {
             disabled={!input.trim() || loading}
             className="bg-finny-accent text-white p-4 rounded-full shadow-2xl disabled:opacity-50 active:scale-90 transition-all transform"
           >
-            <Send className="w-7 h-7" />
+            <Send className="w-7 h-7 text-white" />
           </button>
         </div>
       </footer>
