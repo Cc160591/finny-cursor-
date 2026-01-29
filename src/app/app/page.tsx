@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Bell, Send, User, Loader2, PlusCircle } from "lucide-react";
+import { Bell, Send, User, Loader2, Calendar } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
 
@@ -18,6 +18,7 @@ type Message = {
     options: { id: string; name: string }[];
     pending_transaction: any;
   };
+  dateRangeRequest?: boolean;
 };
 
 export default function ChatPage() {
@@ -71,7 +72,13 @@ export default function ChatPage() {
   const handleSend = async (customPayload?: any) => {
     if ((!input.trim() && !customPayload) || loading) return;
 
-    const userMsgText = customPayload ? `Selezionato conto: ${customPayload.account_name}` : input;
+    let userMsgText = input;
+    if (customPayload?.account_name) {
+      userMsgText = `Selezionato conto: ${customPayload.account_name}`;
+    } else if (customPayload?.date_range_label) {
+      userMsgText = customPayload.date_range_label;
+    }
+
     const userMessage: Message = {
       id: Date.now().toString(),
       role: "user",
@@ -129,6 +136,12 @@ export default function ChatPage() {
             pending_transaction: selectionAction.data.pending_transaction
           };
         }
+
+        // 3. Richiesta periodo date
+        const dateRangeAction = result.actions.find((a: any) => a.type === "needs_date_range");
+        if (dateRangeAction) {
+          assistantMessage.dateRangeRequest = true;
+        }
       }
 
       setMessages((prev) => [...prev, assistantMessage]);
@@ -150,6 +163,14 @@ export default function ChatPage() {
       selected_account_id: option.id,
       account_name: option.name,
       pending_transaction: pendingTransaction
+    });
+  };
+
+  const handleSelectDateRange = (label: string, value: string) => {
+    handleSend({
+      message: label,
+      date_range_label: label,
+      date_range_value: value
     });
   };
 
@@ -210,6 +231,25 @@ export default function ChatPage() {
                       className="bg-finny-accent text-white text-sm font-bold px-4 py-2 rounded-full shadow-md hover:bg-finny-accent/90 transition-all flex items-center space-x-1"
                     >
                       <span>{option.name}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {msg.dateRangeRequest && (
+                <div className="flex flex-wrap gap-2 mt-2 ml-1">
+                  {[
+                    { label: "Questo mese", value: "this_month" },
+                    { label: "Ultimi 30gg", value: "last_30_days" },
+                    { label: "Ultimi 7gg", value: "last_7_days" },
+                  ].map((range) => (
+                    <button
+                      key={range.value}
+                      onClick={() => handleSelectDateRange(range.label, range.value)}
+                      className="bg-white/60 text-finny-dark text-sm font-bold px-4 py-2 rounded-full border border-white shadow-sm hover:bg-white/80 transition-all flex items-center space-x-1"
+                    >
+                      <Calendar className="w-3.5 h-3.5" />
+                      <span>{range.label}</span>
                     </button>
                   ))}
                 </div>

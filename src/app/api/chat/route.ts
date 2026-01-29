@@ -35,11 +35,52 @@ export async function POST(req: Request) {
 
     // 4. Lettura Body
     const { message, selected_account_id, pending_transaction } = await req.json();
-    if (!message && !selected_account_id) {
+    
+    // 5. Fetch Accounts (servono per validare selezioni e dare contesto)
+    const { data: accounts } = await supabaseAdmin
+      .from("accounts")
+      .select("*")
+      .eq("user_id", user.id);
+
+    const finalActions = [];
+    let assistantConfirmationMessage = "";
+
+    // 6. Fix Bug: Se c'è una selezione conto pendente, creiamola SUBITO
+    if (selected_account_id && pending_transaction) {
+      const { data: transaction, error: tError } = await supabaseAdmin
+        .from("transactions")
+        .insert({
+          user_id: user.id,
+          account_id: selected_account_id,
+          type: pending_transaction.type,
+          amount_cents: pending_transaction.amount_cents,
+          merchant: pending_transaction.merchant,
+          notes: pending_transaction.notes
+        })
+        .select()
+        .single();
+
+      if (!tError) {
+        const accountName = accounts?.find(a => a.id === selected_account_id)?.name || "conto selezionato";
+        assistantConfirmationMessage = `Ottimo! Ho registrato la spesa di €${(pending_transaction.amount_cents / 100).toFixed(2)} su ${accountName}.`;
+        
+        // Salviamo il messaggio di conferma nel DB
+        await supabaseAdmin
+          .from("chat_messages")
+          .insert({ user_id: user.id, role: "assistant", content: assistantConfirmationMessage });
+
+        return NextResponse.json({
+          assistant_message: assistantConfirmationMessage,
+          actions: [{ type: "transaction_created", data: { ...pending_transaction, account_id: selected_account_id } }]
+        });
+      }
+    }
+
+    if (!message) {
       return NextResponse.json({ error: "Messaggio mancante" }, { status: 400 });
     }
 
-    // 5. Fetch Context (History, Accounts, Balances)
+    // 7. Fetch Context (History, Balances)
     
     // a. History dal DB (ultimi 15 messaggi)
     const { data: historyData } = await supabaseAdmin
@@ -51,13 +92,7 @@ export async function POST(req: Request) {
     
     const chatHistory = (historyData || []).reverse();
 
-    // b. Accounts dal DB
-    const { data: accounts } = await supabaseAdmin
-      .from("accounts")
-      .select("*")
-      .eq("user_id", user.id);
-
-    // c. Calcolo Saldi per il contesto
+    // b. Calcolo Saldi deterministico
     const balancesContext = [];
     if (accounts && accounts.length > 0) {
       for (const acc of accounts) {
@@ -79,24 +114,44 @@ export async function POST(req: Request) {
       }
     }
 
+    // c. Data e Timezone (Gennaio 2026)
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat('it-IT', {
+      timeZone: 'Europe/Rome',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      weekday: 'long'
+    });
+    const currentTimeStr = formatter.format(now);
+
     const systemPrompt = `
       Sei Finny, un coach finanziario personale ironico e smart.
       Aiuti l'utente a gestire le sue finanze su diversi conti.
+
+      DATI CORRENTI (IMPORTANTE):
+      - Oggi è: ${currentTimeStr}
+      - Timezone: Europe/Rome
+      - Non inventare mai date o anni passati. Siamo nel 2026.
 
       REGOLE:
       1. Se l'utente vuole creare un conto, usa l'azione "create_account".
       2. Se l'utente registra una spesa/entrata:
          - Se l'utente specifica il nome del conto, usalo.
          - Se NON specifica e ci sono più conti, usa "needs_account_selection" per chiedere quale usare.
-         - Se c'è solo un conto, usalo automaticamente.
+         - Se c'è solo un conto, usalo automaticamente senza chiedere.
          - Se non ci sono conti, dì all'utente che deve prima crearne uno.
-      3. Se l'utente chiede il saldo, hai i dati nel CONTESTO sotto.
-      4. Se l'utente chiede un riepilogo e ha più conti, chiedi se lo vuole per un conto specifico o per tutti.
-      5. Sii ironico e smart, ma professionale nei calcoli. Rispondi sempre in italiano.
+      3. Se l'utente chiede il saldo, usa ESATTAMENTE i numeri nel CONTESTO sotto. Non fare calcoli a mente se halluncini.
+      4. Se l'utente chiede un riepilogo delle spese:
+         - Se NON specifica il periodo (es: "questo mese", "settimana scorsa"), usa "needs_date_range" per chiedere il periodo.
+         - Se specifica il periodo, calcola il totale dalle transazioni nel contesto (se presenti) o chiedi i dati se non li hai.
+      5. Sii ironico e smart, ma preciso al centesimo. Rispondi sempre in italiano.
 
       CONTESTO UTENTE:
       - Email: ${user.email}
-      - Conti attuali: ${JSON.stringify(balancesContext)}
+      - Conti e Saldi Attuali: ${JSON.stringify(balancesContext)}
 
       FORMATO RISPOSTA (JSON STRICT):
       {
@@ -108,21 +163,25 @@ export async function POST(req: Request) {
           },
           {
             "type": "create_transaction",
-            "data": { "type": "expense" | "income", "amount_cents": number, "merchant": "string", "account_id": "string", "account_name": "string" }
+            "data": { "type": "expense" | "income", "amount_cents": number, "merchant": "string", "account_name": "string" }
           },
           {
             "type": "needs_account_selection",
             "data": { 
-              "question": "Quale conto vuoi usare?", 
+              "question": "Su quale conto?", 
               "options": [{ "id": "uuid", "name": "string" }],
               "pending_transaction": { "type": "expense" | "income", "amount_cents": number, "merchant": "string" }
             }
+          },
+          {
+            "type": "needs_date_range",
+            "data": { "message": "Per quale periodo vuoi il riepilogo?" }
           }
         ]
       }
     `;
 
-    // 6. Chiamata OpenAI
+    // 8. Chiamata OpenAI
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
@@ -131,19 +190,17 @@ export async function POST(req: Request) {
           role: m.role,
           content: m.content
         })),
-        { role: "user", content: message || `Ho selezionato il conto ${accounts?.find(a => a.id === selected_account_id)?.name}` }
+        { role: "user", content: message }
       ],
       response_format: { type: "json_object" }
     });
 
     const aiResult = JSON.parse(response.choices[0].message.content || "{}");
 
-    // 7. Persistenza messaggi
-    if (message) {
-      await supabaseAdmin
-        .from("chat_messages")
-        .insert({ user_id: user.id, role: "user", content: message });
-    }
+    // 9. Persistenza messaggi
+    await supabaseAdmin
+      .from("chat_messages")
+      .insert({ user_id: user.id, role: "user", content: message });
 
     const { data: assistantMsg } = await supabaseAdmin
       .from("chat_messages")
@@ -151,8 +208,7 @@ export async function POST(req: Request) {
       .select()
       .single();
 
-    // 8. Esecuzione azioni estratte
-    const finalActions = [];
+    // 10. Esecuzione azioni estratte
     if (aiResult.actions) {
       for (const action of aiResult.actions) {
         if (action.type === "create_account") {
@@ -169,15 +225,13 @@ export async function POST(req: Request) {
         }
 
         if (action.type === "create_transaction") {
-          let targetAccountId = action.data.account_id;
+          let targetAccountId = null;
           
-          // Se l'AI ha fornito il nome ma non l'ID, cerchiamolo
-          if (!targetAccountId && action.data.account_name) {
+          if (action.data.account_name) {
             const acc = accounts?.find(a => a.name.toLowerCase() === action.data.account_name.toLowerCase());
             if (acc) targetAccountId = acc.id;
           }
 
-          // Se abbiamo l'ID, creiamo la transazione
           if (targetAccountId) {
             await supabaseAdmin.from("transactions").insert({
               user_id: user.id,
@@ -189,8 +243,8 @@ export async function POST(req: Request) {
             });
             finalActions.push({ type: "transaction_created", data: action.data });
           } else if (accounts && accounts.length > 1) {
-            // Se non abbiamo l'ID e ci sono più conti, forziamo la selezione
-            aiResult.actions.push({
+            // Forza selezione se ambiguo
+            finalActions.push({
               type: "needs_account_selection",
               data: {
                 question: "Su quale conto vuoi registrare questa spesa?",
@@ -199,7 +253,7 @@ export async function POST(req: Request) {
               }
             });
           } else if (accounts && accounts.length === 1) {
-            // Se c'è un solo conto, usiamolo
+            // Unico conto
             await supabaseAdmin.from("transactions").insert({
               user_id: user.id,
               account_id: accounts[0].id,
@@ -212,8 +266,7 @@ export async function POST(req: Request) {
           }
         }
         
-        // Se l'azione è needs_account_selection, la passiamo pulita al client
-        if (action.type === "needs_account_selection") {
+        if (action.type === "needs_account_selection" || action.type === "needs_date_range") {
           finalActions.push(action);
         }
       }
